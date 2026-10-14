@@ -30,8 +30,8 @@ using Microsoft.Win32;
 [assembly: AssemblyDescription("Upload- und Download-Geschwindigkeit in der Taskleiste")]
 [assembly: AssemblyProduct("NetSpeedMonitor")]
 [assembly: AssemblyCopyright("Copyright (c) 2026 hendrikwinkler, MIT License")]
-[assembly: AssemblyVersion("1.0.0.0")]
-[assembly: AssemblyFileVersion("1.0.0.0")]
+[assembly: AssemblyVersion("1.0.1.0")]
+[assembly: AssemblyFileVersion("1.0.1.0")]
 
 namespace NetSpeedMonitor
 {
@@ -44,8 +44,12 @@ namespace NetSpeedMonitor
             using (var mutex = new Mutex(true, @"Local\NetSpeedMonitor.SingleInstance", out createdNew))
             {
                 if (!createdNew) return;   // läuft bereits
-                using (var app = new App())
-                    app.Run();
+                try
+                {
+                    using (var app = new App())
+                        app.Run();
+                }
+                catch (Exception ex) { Log.Error(ex); }   // protokollieren statt Absturzdialog
             }
         }
     }
@@ -58,11 +62,11 @@ namespace NetSpeedMonitor
         const uint WM_TRAYCHECKED = Native.WM_APP + 2;
         static readonly IntPtr TimerSample = (IntPtr)1;
         static readonly IntPtr TimerPlacement = (IntPtr)2;
+        static readonly IntPtr TimerWatch = (IntPtr)3;
         const int CmdBits = 1, CmdAutostart = 2, CmdReserve = 3, CmdExit = 4;
 
         readonly IntPtr instance;
         readonly Native.WndProc hostProc, overlayProc;   // Delegates festhalten, sonst räumt der GC sie weg
-        readonly Native.WinEventProc winEventProc;
         readonly uint wmTaskbarCreated;
         readonly Settings settings;
         readonly NetCounter counter = new NetCounter();
@@ -70,10 +74,10 @@ namespace NetSpeedMonitor
         readonly TrayInspector inspector = new TrayInspector();
         readonly TrayPlaceholders placeholders;
 
-        IntPtr host, overlay, overlayOwner, locationHook, foregroundHook, taskbar, trayNotify;
-        uint hookedProcessId;
+        IntPtr host, overlay, overlayOwner, taskbar;
         bool overlayVisible, needsRender = true, placementPending, darkTaskbar, reservedActive, promotionRemembered;
-        Native.RECT shownBounds;
+        Native.RECT shownBounds, watchedTaskbar, watchedTray;
+        bool watchedTopmost;
         int shownDpi, missingIconTicks;
         double lastUp, lastDown;
         string upText, downText;
@@ -83,7 +87,6 @@ namespace NetSpeedMonitor
             instance = Native.GetModuleHandle(null);
             hostProc = HostWndProc;
             overlayProc = OverlayWndProc;
-            winEventProc = OnWinEvent;
             wmTaskbarCreated = Native.RegisterWindowMessage("TaskbarCreated");
             settings = Settings.Load();
             darkTaskbar = Theme.IsTaskbarDark();
@@ -105,13 +108,10 @@ namespace NetSpeedMonitor
             placeholders = new TrayPlaceholders(host, WM_TRAYICON);
             placeholders.Add(TaskbarDpi(), PlaceholdersLikelyVisible());
 
-            // Vordergrundwechsel (z. B. Vollbild-Anwendung startet) -> Z-Reihenfolge sofort prüfen
-            foregroundHook = Native.SetWinEventHook(Native.EVENT_SYSTEM_FOREGROUND, Native.EVENT_SYSTEM_FOREGROUND,
-                IntPtr.Zero, winEventProc, 0, 0, Native.WINEVENT_OUTOFCONTEXT);
-
             counter.Sample(out lastDown, out lastUp);   // Startwerte der Zähler
             UpdateTexts();
             Native.SetTimer(host, TimerSample, 1000, IntPtr.Zero);
+            Native.SetTimer(host, TimerWatch, 250, IntPtr.Zero);
             Refresh();
         }
 
@@ -127,9 +127,6 @@ namespace NetSpeedMonitor
 
         public void Dispose()
         {
-            if (locationHook != IntPtr.Zero) Native.UnhookWinEvent(locationHook);
-            if (foregroundHook != IntPtr.Zero) Native.UnhookWinEvent(foregroundHook);
-            locationHook = foregroundHook = IntPtr.Zero;
             placeholders.Remove();
             DestroyOverlay();
             if (host != IntPtr.Zero && Native.IsWindow(host)) Native.DestroyWindow(host);
@@ -165,6 +162,7 @@ namespace NetSpeedMonitor
                 {
                     case Native.WM_TIMER:
                         if (wParam == TimerSample) OnSampleTimer();
+                        else if (wParam == TimerWatch) OnWatchTimer();
                         else if (wParam == TimerPlacement)
                         {
                             Native.KillTimer(hWnd, TimerPlacement);
@@ -214,24 +212,34 @@ namespace NetSpeedMonitor
             return Native.DefWindowProc(hWnd, msg, wParam, lParam);
         }
 
-        void OnWinEvent(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time)
-        {
-            try
-            {
-                // Vordergrundwechsel, oder Taskleiste/Infobereich wurden verschoben bzw. vergrößert -> sofort nachziehen
-                if (evt == Native.EVENT_SYSTEM_FOREGROUND
-                    || (idObject == Native.OBJID_WINDOW && hwnd != IntPtr.Zero && (hwnd == taskbar || hwnd == trayNotify)))
-                    SchedulePlacement();
-            }
-            catch (Exception ex) { Log.Error(ex); }
-        }
-
         // ---------------------------------------------------------------- Ereignisse
 
         void OnSampleTimer()
         {
             counter.Sample(out lastDown, out lastUp);
             UpdateTexts();
+            Refresh();
+        }
+
+        // Statt systemweiter Ereignis-Hooks: viermal pro Sekunde ein paar billige Abfragen (~0,01 ms). Ändern sich
+        // Lage oder "Topmost"-Zustand der Taskleiste (z. B. Vollbild-Anwendung) oder die Breite des Infobereichs,
+        // wird die Anzeige sofort neu ausgerichtet; alles andere erledigt der Sekundentakt.
+        void OnWatchTimer()
+        {
+            Native.RECT tbRect = new Native.RECT(), trayRect = new Native.RECT();
+            bool topmost = false;
+            IntPtr tb = Native.FindWindow("Shell_TrayWnd", null);
+            if (tb != IntPtr.Zero)
+            {
+                Native.GetWindowRect(tb, out tbRect);
+                topmost = (Native.GetWindowLong(tb, Native.GWL_EXSTYLE) & Native.WS_EX_TOPMOST) != 0;
+                IntPtr tray = Native.FindWindowEx(tb, IntPtr.Zero, "TrayNotifyWnd", null);
+                if (tray != IntPtr.Zero) Native.GetWindowRect(tray, out trayRect);
+            }
+            if (tbRect.Equals(watchedTaskbar) && trayRect.Equals(watchedTray) && topmost == watchedTopmost) return;
+            watchedTaskbar = tbRect;
+            watchedTray = trayRect;
+            watchedTopmost = topmost;
             Refresh();
         }
 
@@ -362,12 +370,8 @@ namespace NetSpeedMonitor
             p = new Placement();
             IntPtr tb = Native.FindWindow("Shell_TrayWnd", null);
             if (tb == IntPtr.Zero || !Native.IsWindowVisible(tb)) return false;
-            if (tb != taskbar)
-            {
-                taskbar = tb;
-                HookTaskbarProcess(tb);
-            }
-            trayNotify = Native.FindWindowEx(tb, IntPtr.Zero, "TrayNotifyWnd", null);
+            taskbar = tb;
+            IntPtr trayNotify = Native.FindWindowEx(tb, IntPtr.Zero, "TrayNotifyWnd", null);
 
             Native.RECT tbRect;
             if (!Native.GetWindowRect(tb, out tbRect) || tbRect.Width <= 0 || tbRect.Height <= 0) return false;
@@ -456,17 +460,6 @@ namespace NetSpeedMonitor
             return ok;
         }
 
-        void HookTaskbarProcess(IntPtr tb)
-        {
-            uint pid;
-            Native.GetWindowThreadProcessId(tb, out pid);
-            if (pid == hookedProcessId && locationHook != IntPtr.Zero) return;
-            if (locationHook != IntPtr.Zero) Native.UnhookWinEvent(locationHook);
-            locationHook = Native.SetWinEventHook(Native.EVENT_OBJECT_LOCATIONCHANGE, Native.EVENT_OBJECT_LOCATIONCHANGE,
-                IntPtr.Zero, winEventProc, pid, 0, Native.WINEVENT_OUTOFCONTEXT);
-            hookedProcessId = pid;
-        }
-
         static int TaskbarDpi()
         {
             IntPtr tb = Native.FindWindow("Shell_TrayWnd", null);
@@ -547,7 +540,9 @@ namespace NetSpeedMonitor
                         Refresh();
                         break;
                     case CmdAutostart:
-                        Autostart.Set(!Autostart.IsEnabled());
+                        if (!Autostart.Set(!Autostart.IsEnabled()))
+                            Native.MessageBox(host, Text.AutostartFailed, "NetSpeedMonitor",
+                                Native.MB_ICONWARNING | Native.MB_TOPMOST | Native.MB_SETFOREGROUND);
                         break;
                     case CmdReserve:
                         ExplainReservedSpace();
@@ -1080,9 +1075,13 @@ namespace NetSpeedMonitor
         public bool PromotedInRegistry()
         {
             int promoted = 0;
-            foreach (RegistryKey key in OwnSettingsKeys(false))
-                using (key)
-                    if (IsPromoted(key)) promoted++;
+            try
+            {
+                foreach (RegistryKey key in OwnSettingsKeys(false))
+                    using (key)
+                        if (IsPromoted(key)) promoted++;
+            }
+            catch (Exception ex) { Log.Error(ex); }
             return promoted >= Count;
         }
 
@@ -1091,9 +1090,13 @@ namespace NetSpeedMonitor
         // Neustarts sicher übersteht und die Einstellungen ihn korrekt als "an" zeigen.
         public void RememberPromoted()
         {
-            foreach (RegistryKey key in OwnSettingsKeys(true))
-                using (key)
-                    if (!IsPromoted(key)) key.SetValue("IsPromoted", 1, RegistryValueKind.DWord);
+            try
+            {
+                foreach (RegistryKey key in OwnSettingsKeys(true))
+                    using (key)
+                        if (!IsPromoted(key)) key.SetValue("IsPromoted", 1, RegistryValueKind.DWord);
+            }
+            catch (Exception ex) { Log.Error(ex); }
         }
 
         static bool IsPromoted(RegistryKey key)
@@ -1316,6 +1319,13 @@ namespace NetSpeedMonitor
         public static readonly string Placeholder = German
             ? "NetSpeedMonitor (Platzhalter {0}/{1})"
             : "NetSpeedMonitor (placeholder {0}/{1})";
+        public static readonly string AutostartFailed = German
+            ? "Der Autostart-Eintrag konnte nicht geändert werden.\n\n" +
+              "Vermutlich sperrt ihn ein Virenscanner. Füge NetSpeedMonitor dort als Ausnahme hinzu " +
+              "(ggf. danach Windows neu starten) und versuche es erneut."
+            : "The autostart entry could not be changed.\n\n" +
+              "An antivirus program is probably blocking it. Add NetSpeedMonitor as an exception there " +
+              "(restart Windows if needed) and try again.";
         public static readonly string ReserveTitle = German
             ? "NetSpeedMonitor \u2013 fester Platz"
             : "NetSpeedMonitor \u2013 fixed spot";
@@ -1348,15 +1358,19 @@ namespace NetSpeedMonitor
         public static Settings Load()
         {
             var s = new Settings();
-            using (var key = Registry.CurrentUser.OpenSubKey(KeyPath))
+            try
             {
-                if (key != null)
+                using (var key = Registry.CurrentUser.OpenSubKey(KeyPath))
                 {
-                    s.UseBits = Flag(key, "UseBits");
-                    s.Initialized = Flag(key, "Initialized");
-                    s.Reserved = Flag(key, "Reserved");
+                    if (key != null)
+                    {
+                        s.UseBits = Flag(key, "UseBits");
+                        s.Initialized = Flag(key, "Initialized");
+                        s.Reserved = Flag(key, "Reserved");
+                    }
                 }
             }
+            catch (Exception ex) { Log.Error(ex); }
             return s;
         }
 
@@ -1368,12 +1382,16 @@ namespace NetSpeedMonitor
 
         public void Save()
         {
-            using (var key = Registry.CurrentUser.CreateSubKey(KeyPath))
+            try
             {
-                key.SetValue("UseBits", UseBits ? 1 : 0, RegistryValueKind.DWord);
-                key.SetValue("Initialized", Initialized ? 1 : 0, RegistryValueKind.DWord);
-                key.SetValue("Reserved", Reserved ? 1 : 0, RegistryValueKind.DWord);
+                using (var key = Registry.CurrentUser.CreateSubKey(KeyPath))
+                {
+                    key.SetValue("UseBits", UseBits ? 1 : 0, RegistryValueKind.DWord);
+                    key.SetValue("Initialized", Initialized ? 1 : 0, RegistryValueKind.DWord);
+                    key.SetValue("Reserved", Reserved ? 1 : 0, RegistryValueKind.DWord);
+                }
             }
+            catch (Exception ex) { Log.Error(ex); }   // nicht speichern zu können ist kein Grund abzustürzen
         }
     }
 
@@ -1386,39 +1404,65 @@ namespace NetSpeedMonitor
         public static string ExePath { get { return Assembly.GetExecutingAssembly().Location; } }
         static string Command { get { return "\"" + ExePath + "\""; } }
 
+        // Nur "an", wenn der Eintrag auch wirklich auf diese EXE zeigt
         public static bool IsEnabled()
         {
-            using (var run = Registry.CurrentUser.OpenSubKey(RunKey))
-                if (run == null || run.GetValue(ValueName) == null) return false;
-            using (var approved = Registry.CurrentUser.OpenSubKey(ApprovedKey))
+            try
             {
-                // im Task-Manager bzw. in den Einstellungen deaktiviert: erstes Byte ungerade
-                var data = approved == null ? null : approved.GetValue(ValueName) as byte[];
-                if (data != null && data.Length > 0 && (data[0] & 1) != 0) return false;
+                string current;
+                using (var run = Registry.CurrentUser.OpenSubKey(RunKey))
+                    current = run == null ? null : run.GetValue(ValueName) as string;
+                if (current == null || !string.Equals(current.Trim('"', ' '), ExePath, StringComparison.OrdinalIgnoreCase))
+                    return false;
+                using (var approved = Registry.CurrentUser.OpenSubKey(ApprovedKey))
+                {
+                    // im Task-Manager bzw. in den Einstellungen deaktiviert: erstes Byte ungerade
+                    var data = approved == null ? null : approved.GetValue(ValueName) as byte[];
+                    if (data != null && data.Length > 0 && (data[0] & 1) != 0) return false;
+                }
+                return true;
             }
-            return true;
+            catch (Exception ex)
+            {
+                Log.Error(ex);
+                return false;
+            }
         }
 
-        public static void Set(bool enable)
+        // false, wenn sich der Eintrag nicht ändern ließ (z. B. weil ein Virenscanner ihn sperrt)
+        public static bool Set(bool enable)
         {
-            using (var run = Registry.CurrentUser.CreateSubKey(RunKey))
+            try
             {
-                if (enable) run.SetValue(ValueName, Command);
-                else run.DeleteValue(ValueName, false);
+                using (var run = Registry.CurrentUser.CreateSubKey(RunKey))
+                {
+                    if (enable) run.SetValue(ValueName, Command);
+                    else run.DeleteValue(ValueName, false);
+                }
+                using (var approved = Registry.CurrentUser.OpenSubKey(ApprovedKey, true))
+                    if (approved != null) approved.DeleteValue(ValueName, false);
+                return true;
             }
-            using (var approved = Registry.CurrentUser.OpenSubKey(ApprovedKey, true))
-                if (approved != null) approved.DeleteValue(ValueName, false);
+            catch (Exception ex)
+            {
+                Log.Error(ex);
+                return false;
+            }
         }
 
         // Wurde die EXE verschoben, zeigt der Autostart-Eintrag auf den neuen Ort
         public static void UpdatePath()
         {
-            using (var run = Registry.CurrentUser.OpenSubKey(RunKey, true))
+            try
             {
-                string current = run == null ? null : run.GetValue(ValueName) as string;
-                if (current != null && !string.Equals(current, Command, StringComparison.OrdinalIgnoreCase))
-                    run.SetValue(ValueName, Command);
+                using (var run = Registry.CurrentUser.OpenSubKey(RunKey, true))
+                {
+                    string current = run == null ? null : run.GetValue(ValueName) as string;
+                    if (current != null && !string.Equals(current, Command, StringComparison.OrdinalIgnoreCase))
+                        run.SetValue(ValueName, Command);
+                }
             }
+            catch (Exception ex) { Log.Error(ex); }
         }
     }
 
@@ -1487,7 +1531,6 @@ namespace NetSpeedMonitor
     static class Native
     {
         public delegate IntPtr WndProc(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
-        public delegate void WinEventProc(IntPtr hook, uint evt, IntPtr hwnd, int idObject, int idChild, uint thread, uint time);
 
         public const uint WM_NULL = 0x0000, WM_DESTROY = 0x0002, WM_SETTINGCHANGE = 0x001A, WM_MOUSEACTIVATE = 0x0021,
             WM_DISPLAYCHANGE = 0x007E, WM_TIMER = 0x0113, WM_RBUTTONUP = 0x0205, WM_DPICHANGED = 0x02E0, WM_APP = 0x8000;
@@ -1499,8 +1542,6 @@ namespace NetSpeedMonitor
         public const int SW_HIDE = 0, SW_SHOWNOACTIVATE = 4;
         public const int ULW_ALPHA = 2;
         public const uint MONITOR_DEFAULTTONEAREST = 2;
-        public const uint EVENT_SYSTEM_FOREGROUND = 0x0003, EVENT_OBJECT_LOCATIONCHANGE = 0x800B, WINEVENT_OUTOFCONTEXT = 0;
-        public const int OBJID_WINDOW = 0;
         public const uint GW_HWNDNEXT = 2, GW_HWNDPREV = 3;
         public static readonly IntPtr HWND_TOP = IntPtr.Zero;
         public const uint SWP_NOSIZE = 0x1, SWP_NOMOVE = 0x2, SWP_NOACTIVATE = 0x10, SWP_NOOWNERZORDER = 0x200;
@@ -1508,7 +1549,7 @@ namespace NetSpeedMonitor
         public const uint MF_CHECKED = 0x8, MF_SEPARATOR = 0x800;
         public const uint TPM_RIGHTBUTTON = 0x2, TPM_RIGHTALIGN = 0x8, TPM_TOPALIGN = 0x0, TPM_BOTTOMALIGN = 0x20,
             TPM_NONOTIFY = 0x80, TPM_RETURNCMD = 0x100;
-        public const uint MB_YESNO = 0x4, MB_ICONINFORMATION = 0x40, MB_SETFOREGROUND = 0x10000, MB_TOPMOST = 0x40000;
+        public const uint MB_YESNO = 0x4, MB_ICONWARNING = 0x30, MB_ICONINFORMATION = 0x40, MB_SETFOREGROUND = 0x10000, MB_TOPMOST = 0x40000;
         public const int IDYES = 6;
         public const int NIM_ADD = 0, NIM_MODIFY = 1, NIM_DELETE = 2, NIM_SETVERSION = 4;
         public const int NIF_MESSAGE = 0x1, NIF_ICON = 0x2, NIF_TIP = 0x4, NIF_SHOWTIP = 0x80;
@@ -1625,12 +1666,8 @@ namespace NetSpeedMonitor
         [DllImport("user32.dll")] public static extern int GetSystemMetricsForDpi(int index, uint dpi);
         [DllImport("user32.dll")] public static extern IntPtr MonitorFromWindow(IntPtr hWnd, uint flags);
         [DllImport("user32.dll")] public static extern bool GetMonitorInfo(IntPtr monitor, ref MONITORINFO info);
-        [DllImport("user32.dll")] public static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint processId);
         [DllImport("user32.dll")] public static extern bool UpdateLayeredWindow(IntPtr hWnd, IntPtr hdcDst, ref POINT dst, ref SIZE size,
             IntPtr hdcSrc, ref POINT src, int colorKey, ref BLENDFUNCTION blend, int flags);
-        [DllImport("user32.dll")] public static extern IntPtr SetWinEventHook(uint eventMin, uint eventMax, IntPtr module,
-            WinEventProc callback, uint processId, uint threadId, uint flags);
-        [DllImport("user32.dll")] public static extern bool UnhookWinEvent(IntPtr hook);
         [DllImport("user32.dll")] public static extern IntPtr CreatePopupMenu();
         [DllImport("user32.dll", CharSet = CharSet.Unicode)] public static extern bool AppendMenu(IntPtr menu, uint flags, IntPtr id, string text);
         [DllImport("user32.dll")] public static extern int TrackPopupMenuEx(IntPtr menu, uint flags, int x, int y, IntPtr hWnd, IntPtr tpm);

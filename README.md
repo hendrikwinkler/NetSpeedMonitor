@@ -54,6 +54,15 @@ Run `build.bat`. It uses the C# compiler that ships with Windows (.NET Framework
 2. Delete the EXE.
 3. Optional: remove its settings with `reg delete HKCU\Software\NetSpeedMonitor /f`.
 
+## Antivirus false positives
+
+Antivirus products with behavior-based detection may flag NetSpeedMonitor, for example Bitdefender with *Atc4.Detection*. The reason is that an unknown, unsigned program that adds itself to autostart and attaches to the taskbar resembles patterns that malware also uses. The complete source code is in this repository, so you can review it and build the EXE yourself.
+
+If it gets quarantined:
+
+1. Restore it in your antivirus. This usually adds an exception at the same time.
+2. Optionally report the false positive to the vendor, e.g. to [Bitdefender](https://www.bitdefender.com/consumer/support/answer/29358/).
+
 ---
 
 ## Deutsch
@@ -71,6 +80,8 @@ Schlanke Anzeige von Upload- und Download-Geschwindigkeit in der Taskleiste von 
 **Selbst bauen:** `build.bat` ausführen; dafür muss nichts installiert werden.
 
 **Entfernen:** Rechtsklick, *Mit Windows starten* abhaken, *Beenden*, dann die EXE löschen. Optional noch `reg delete HKCU\Software\NetSpeedMonitor /f` ausführen.
+
+**Virenscanner:** Programme mit Verhaltenserkennung können NetSpeedMonitor fälschlich melden, zum Beispiel Bitdefender mit *Atc4.Detection*. Eine unbekannte, unsignierte EXE, die sich in den Autostart einträgt und an die Taskleiste hängt, ähnelt nämlich Mustern von Schadsoftware. Der komplette Quellcode liegt hier im Repo. Landet die EXE in der Quarantäne, im Virenscanner wiederherstellen; das legt meist gleich eine Ausnahme an. Den Fehlalarm kann man optional beim Hersteller melden, etwa bei [Bitdefender](https://www.bitdefender.com/consumer/support/answer/29358/).
 
 ---
 
